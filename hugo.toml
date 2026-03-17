@@ -2,3 +2,10 @@ baseURL = 'https://bhavya01.github.io/'
 locale = 'en-us'
 title = 'Bhavya Bahl'
 theme = 'PaperMod'
+
+[params.homeInfoParams]
+  Content = """
+    I spend my time at Google making PyTorch fly on TPUs.
+    This blog is where I will document technical deep dives,
+    the philosophical 'why' and everything in between.
+  """
