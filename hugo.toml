@@ -1,0 +1,4 @@
+baseURL = 'https://bhavya01.github.io/'
+locale = 'en-us'
+title = 'Bhavya Bahl'
+theme = 'PaperMod'
