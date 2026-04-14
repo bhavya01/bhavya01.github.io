@@ -2,52 +2,25 @@
 title = "Inside mini-nccl: Building a PyTorch Distributed Backend from Scratch"
 date = 2026-04-14
 draft = false
-tags = ["pytorch", "distributed", "cuda", "ml-systems"]
+tags = ["pytorch", "distributed", "cuda"]
 description = "A deep dive into how collective communication operations work, illustrated by building a custom torch.distributed backend from scratch."
 +++
 
-Every time you call `dist.all_reduce(gradients)` inside a PyTorch DDP loop, you're
-invoking a small piece of infrastructure that coordinates memory across potentially
-hundreds of GPUs without a single centralized controller. That infrastructure is
-NCCL — and most people use it daily without ever peering inside.
+I work on making it easier to program TPUs with PyTorch during my day job. Even though
+chip providers pack huge HBM capacity into today's chips, performant distributed programs
+are still necessary to train and run frontier large language models. Since I work
+mostly on TPUs, I was curious what abstractions other hardwares provide to program their
+distributed backends. What better way to find out than building one yourself.
 
-This post walks through [mini-nccl](https://github.com/bhavya01/mini-nccl), a from-scratch
-implementation of a PyTorch distributed backend. The goal is not to build something
-production-ready, but to make the concepts concrete: what a collective *is*, how the
-`torch.distributed` plugin interface works, and how peer-to-peer GPU memory transfers
-actually happen. By the end you should be able to read a `dist.all_reduce` call and
-trace exactly what happens between your Python and the GPU silicon.
-
----
-
-## Why Collectives?
-
-Distributed training sits on top of one question: *how do I aggregate information from N
-processes and give every process back a consistent view?*
-
-The most common pattern is **Distributed Data Parallel (DDP)**. Each rank holds a
-complete model replica, trains on a different mini-batch, and after the backward pass
-needs gradients that look as if they came from the full batch. The answer is an
-**all-reduce**: every rank contributes its local gradients, the operation sums them
-across all ranks, and every rank ends up with the same summed result.
-
-```
-  Rank 0: grad = [1, 2]          After all_reduce (SUM)
-  Rank 1: grad = [3, 4]    ────►   every rank holds [4, 6]
-  Rank 2: grad = [0, 0]
-```
-
-FSDP (Fully Sharded Data Parallel) is more nuanced: instead of replicating the full
-model, each rank shards the parameters and uses **reduce-scatter** to aggregate
-gradients into per-rank shards, and **all-gather** to reconstruct the full layer
-before the forward pass.
-
-Pipeline parallelism uses point-to-point sends and receives to pass activations between
-pipeline stages.
-
-The common thread: these patterns are not custom network protocols invented per-model.
-They are a small, well-defined set of **collective operations** that the library
-(NCCL in practice, mini-nccl in this post) implements once, and frameworks build on top.
+I created [mini-nccl](https://github.com/bhavya01/mini-nccl), a from-scratch
+implementation of a PyTorch distributed backend for GPUs attached to a single node. The
+goal is not to build something production-ready, but to make the concepts concrete: what
+a collective *is*, how the `torch.distributed` plugin interface works, and how
+peer-to-peer GPU memory transfers actually happen. By the end you should be able to read
+a `torch.distributed.all_reduce` call and trace exactly what happens between Python and
+the GPU silicon. Each collective has its own `.cu` file, and the examples directory has
+a runnable script for every operation — if you have two or more GPUs, you can run them
+today.
 
 ---
 
@@ -59,23 +32,23 @@ distributed stack.
 ```
   ┌─────────────────────────────────────────────────┐
   │            User code / DDP / FSDP               │
-  │         dist.all_reduce(tensor, ...)             │
+  │         dist.all_reduce(tensor, ...)            │
   └───────────────────┬─────────────────────────────┘
                       │
   ┌───────────────────▼─────────────────────────────┐
-  │            torch.distributed (Python)            │
-  │   Dispatches to the active ProcessGroup backend  │
+  │            torch.distributed (Python)           │
+  │   Dispatches to the active ProcessGroup backend │
   └───────────────────┬─────────────────────────────┘
                       │
   ┌───────────────────▼─────────────────────────────┐
-  │            ProcessGroup Backend (C++)            │
-  │   Interface: allreduce(), broadcast(), ...       │
-  │   mini-nccl implements this interface            │
+  │            ProcessGroup Backend (C++)           │
+  │   Interface: allreduce(), broadcast(), ...      │
+  │   mini-nccl implements this interface           │
   └───────────────────┬─────────────────────────────┘
                       │
   ┌───────────────────▼─────────────────────────────┐
-  │            CUDA Runtime / Hardware               │
-  │   cudaMemcpyPeer, cudaIpcGetMemHandle, ...       │
+  │            CUDA Runtime / Hardware              │
+  │   cudaMemcpyPeer, cudaIpcGetMemHandle, ...      │
   └─────────────────────────────────────────────────┘
 ```
 
@@ -636,31 +609,40 @@ race ahead while the GPU runs the collective asynchronously.
 Mini-nccl is deliberately simplified to make the concepts legible. Here's what a
 production-grade NCCL does differently:
 
-**Ring and tree algorithms.** Mini-nccl's all-reduce has every rank read from every
-other rank: O(N) IPC opens and N P2P copies per rank. Real NCCL uses a ring all-reduce
-where each rank only exchanges data with its two neighbors, achieving O(1) neighbors
-per rank with roughly 2(N-1)/N bandwidth efficiency. Tree reductions are used for
-small messages where latency matters more than bandwidth.
+### Ring and tree algorithms
 
-**Topology awareness.** `nvidia-smi topo -m` reveals that NVLink connections between
-GPUs are not all equal — GPUs in the same NVSwitch fabric talk much faster than those
-bridged via PCIe. NCCL inspects the topology at init time and builds a communication
-graph that routes reductions along high-bandwidth links.
+Mini-nccl's all-reduce has every rank read from every other rank: O(N) IPC opens and
+N P2P copies per rank. Real NCCL uses a ring all-reduce where each rank only exchanges
+data with its two neighbors, achieving O(1) neighbors per rank with roughly 2(N-1)/N
+bandwidth efficiency. Tree reductions are used for small messages where latency matters
+more than bandwidth.
 
-**Kernel fusion and pipelining.** Mini-nccl issues separate CUDA API calls for each
-transfer. NCCL fuses the copy and reduction into a single custom CUDA kernel, avoids
-round-trips through the CPU between each step, and pipelines multiple chunks through
-the ring simultaneously (double-buffering) to hide latency.
+### Topology awareness
 
-**CUDA streams and async execution.** Every collective in mini-nccl is synchronous on
-the CPU — `store->wait` blocks the calling thread. NCCL submits all work to CUDA
-streams and returns immediately. The CPU and GPU overlap: while the GPU runs an
-all-reduce, the CPU is already dispatching the next batch of forward-pass kernels.
+`nvidia-smi topo -m` reveals that NVLink connections between GPUs are not all equal —
+GPUs in the same NVSwitch fabric talk much faster than those bridged via PCIe. NCCL
+inspects the topology at init time and builds a communication graph that routes
+reductions along high-bandwidth links.
 
-**NVLink / SHARP / InfiniBand.** For multi-node clusters, NCCL uses RDMA over
-InfiniBand for inter-node transfers, and in some configurations can offload the
-reduction to in-network compute (NVIDIA SHARP). Mini-nccl is single-rack, single-hop,
-CUDA-only.
+### Kernel fusion and pipelining
+
+Mini-nccl issues separate CUDA API calls for each transfer. NCCL fuses the copy and
+reduction into a single custom CUDA kernel, avoids round-trips through the CPU between
+each step, and pipelines multiple chunks through the ring simultaneously
+(double-buffering) to hide latency.
+
+### CUDA streams and async execution
+
+Every collective in mini-nccl is synchronous on the CPU — `store->wait` blocks the
+calling thread. NCCL submits all work to CUDA streams and returns immediately. The CPU
+and GPU overlap: while the GPU runs an all-reduce, the CPU is already dispatching the
+next batch of forward-pass kernels.
+
+### NVLink / SHARP / InfiniBand
+
+For multi-node clusters, NCCL uses RDMA over InfiniBand for inter-node transfers, and
+in some configurations can offload the reduction to in-network compute (NVIDIA SHARP).
+Mini-nccl is single-rack, single-hop, CUDA-only.
 
 ---
 
@@ -684,6 +666,14 @@ None of these pieces are mysterious on their own. Together they form the plumbin
 lets a gradient computed on GPU 127 become part of the update applied on GPU 0 in a
 single synchronous step.
 
-The code for mini-nccl lives at [github.com/bhavya01/mini-nccl](https://github.com/bhavya01/mini-nccl).
-Each collective has its own `.cu` file, and the examples directory has a runnable
-script for every operation. If you have two or more GPUs, you can run them today.
+---
+
+## What's Next
+
+The obvious next step is benchmarking mini-nccl against PyTorch's production NCCL
+backend. I want to measure throughput and latency for each collective across a range
+of tensor sizes and rank counts, then trace *why* the numbers land where they do.
+
+The gap should be large — mini-nccl makes no attempt at efficiency — but the interesting
+question is *where* the gap comes from and whether it shifts by collective. I'll write up the results once the benchmarks are in. Stay tuned!
+
