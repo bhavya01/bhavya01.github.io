@@ -646,6 +646,48 @@ Mini-nccl is single-rack, single-hop, CUDA-only.
 
 ---
 
+## Benchmarks
+
+I benchmarked three collectives: all-gather, all-reduce and all-to-all against PyTorch's production NCCL backend on a
+single node with **2 L4 GPUs** (`world_size=2`), float32 tensors, aggregated over 10
+runs of 20 timed iterations each (5 warmup). (If I have spare time, I might try H100 next.) The full tables, including algorithm
+bandwidth, live in [`benchmarks/results.md`](https://github.com/bhavya01/mini-nccl)
+in the repo.
+
+The headline result is a **fixed latency floor**. Every mini-nccl collective takes
+roughly 10 ms regardless of message size until the payload gets large enough to
+dominate that overhead. NCCL, by contrast, is sub-millisecond for small messages.
+This is the cost of the three-phase protocol: a synchronous store-based barrier plus
+CUDA IPC handle open/close on every single call, none of it overlapped with compute.
+
+NCCL latency speedup over mini-nccl, per collective:
+
+| per-rank tensor | all_gather | all_reduce | all_to_all |
+|---|---|---|---|
+| 1 MiB   | 29.5× | 36.7× | 64.8× |
+| 16 MiB  | 2.0×  | 2.8×  | 5.8×  |
+| 64 MiB  | 0.9×  | 1.3×  | 2.1×  |
+| 256 MiB | 0.8×  | 1.0×  | 1.4×  |
+
+Two things stand out. First, the gap collapses as tensors grow — once a single
+transfer takes tens of milliseconds, the fixed 10 ms barrier stops mattering. For
+all_gather and all_reduce at 256 MiB, mini-nccl actually *edges out* NCCL (speedup
+< 1.0×), plateauing around 4.5 GB/s of algorithm bandwidth versus NCCL's ~3.3–4.3
+GB/s.
+
+
+Second, all_to_all stays NCCL-favored at every size (1.4× even at 256 MiB).
+Unlike all-reduce, all-to-all doesn't degenerate at N=2 the same way, and
+mini-nccl's bandwidth tops out around 3.2 GB/s against NCCL's 4.4 GB/s — the
+clearest signal here of what fused, pipelined kernels buy you.
+
+The takeaway: mini-nccl's headline weakness is **per-call overhead**, not raw
+copy throughput. Closing the small-message gap means attacking the synchronous
+barrier and IPC churn — persistent handles, CUDA-stream-backed async `Work`
+objects — long before topology-aware ring algorithms would pay off.
+
+---
+
 ## Conclusion
 
 Starting from `dist.all_reduce(tensor)` and ending at `cudaMemcpyPeer`, the path goes
@@ -666,14 +708,7 @@ None of these pieces are mysterious on their own. Together they form the plumbin
 lets a gradient computed on GPU 127 become part of the update applied on GPU 0 in a
 single synchronous step.
 
----
-
-## What's Next
-
-The obvious next step is benchmarking mini-nccl against PyTorch's production NCCL
-backend. I want to measure throughput and latency for each collective across a range
-of tensor sizes and rank counts, then trace *why* the numbers land where they do.
-
-The gap should be large — mini-nccl makes no attempt at efficiency — but the interesting
-question is *where* the gap comes from and whether it shifts by collective. I'll write up the results once the benchmarks are in. Stay tuned!
+The benchmarks below show the cost of that simplicity: mini-nccl pays a flat
+per-collective overhead that makes it 30–65× slower than NCCL on small tensors, yet
+its raw peer-to-peer bandwidth stays competitive on large ones.
 
