@@ -5,3 +5,12 @@ theme = 'PaperMod'
 
 [params.homeInfoParams]
   Content = "I spend my time at Google making PyTorch fly on TPUs. This blog is where I document technical deep dives, the philosophical 'why' and everything in between."
+
+[markup]
+  [markup.goldmark]
+    [markup.goldmark.extensions]
+      [markup.goldmark.extensions.passthrough]
+        enable = true
+        [markup.goldmark.extensions.passthrough.delimiters]
+          block = [['$$', '$$']]
+          inline = [['\(', '\)']]
