@@ -60,7 +60,8 @@ KV heads — an 16:1 GQA ratio similar to Llama 3's largest models — served in
 
 $$
 \begin{aligned}
-\text{KV cache per token per layer} &= 2 \cdot H_{kv} \cdot d_{head} \cdot \text{bytes} = 2 \cdot 8 \cdot 128 \cdot 2\ \text{bytes} = 4\ \text{KiB}\\[4pt]
+\text{KV cache per token per layer} &= 2 \cdot H_{kv} \cdot d_{head} \cdot \text{bytes} \\
+&= 2 \cdot 8 \cdot 128 \cdot 2\ \text{bytes} = 4\ \text{KiB}\\[4pt]
 \text{KV cache per token (all 128 layers)} &= 4\ \text{KiB} \times 128 = 512\ \text{KiB}
 \end{aligned}
 $$
@@ -139,25 +140,27 @@ $$
 o_i = \sum_j \big(\phi(q_i) \cdot \phi(k_j)\big)\, v_j = \phi(q_i) \cdot \sum_j \phi(k_j)\, v_j^\top
 $$
 
+*For the rest of this article, we'll assume \(\phi(x) = x\) to keep the equations
+uncluttered.*
+
 **Why this matters: matmul associativity.** In matrix form, standard attention computes
 \((QK^\top)V\) — form the \(n \times n\) matrix \(QK^\top\) first, then multiply by \(V\). Because
-\(\phi(Q)\phi(K)^\top\) is just an ordinary matrix product with no softmax in the way, matrix
+\(QK^\top\) is just an ordinary matrix product with no softmax in the way, matrix
 multiplication is associative and we're free to instead compute
-\(\phi(Q)\big(\phi(K)^\top V\big)\). The second grouping never materializes an
-\(n \times n\) matrix at all: \(\phi(K)^\top V\) is a \(d \times d\) matrix (summed over all \(n\)
-tokens), and \(\phi(Q)\) times that is \(O(n d^2)\) — **linear** in sequence length instead of
-quadratic. (A separate normalizing term, \(z = \sum_j \phi(k_j)\), is tracked the same way
-so the output can be divided by \(\phi(q_i) \cdot z\), playing the role softmax's
-normalization played.)
+\(Q\big(K^\top V\big)\). The second grouping never materializes an
+\(n \times n\) matrix at all: \(K^\top V\) is a \(d \times d\) matrix (summed over all \(n\)
+tokens), and \(Q\) times that is \(O(n d^2)\) — **linear** in sequence length instead of
+quadratic.
 
-**The recurrent, constant-memory form.** The \(d \times d\) matrix \(S = \phi(K)^\top V\) is
-just a sum of rank-1 outer products, \(S = \sum_j \phi(k_j)\, v_j^\top\), which means it can
-be built up one token at a time:
+**The recurrent, constant-memory form.** Let's take a closer look at what linear attention
+is doing by looking at how we process tokens one at a time during decode. The
+\(d \times d\) matrix \(S = K^\top V\) is just a sum of rank-1 outer products,
+\(S = \sum_j k_j\, v_j^\top\), which means it can be built up one token at a time:
 
 $$
 \begin{aligned}
-S_t &= S_{t-1} + \phi(k_t)\, v_t^\top \qquad \text{(state update, }S\text{ is }d \times d\text{)}\\[4pt]
-o_t &= \phi(q_t) \cdot S_t \qquad\qquad\quad\ \text{(readout)}
+S_t &= S_{t-1} + k_t\, v_t^\top \qquad \text{(state update, }S\text{ is }d \times d\text{)}\\[4pt]
+o_t &= q_t \cdot S_t \qquad\qquad\quad\ \text{(readout)}
 \end{aligned}
 $$
 
