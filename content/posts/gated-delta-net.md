@@ -16,15 +16,14 @@ $$
 \mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V
 $$
 
-For a sequence of length \(n\) and head dimension \(d\), \(QK^\top\) is an \(n \times n\) matrix —
-every token computes a similarity score against every other token. This is the source of
+For a sequence of length \(n\) and head dimension \(d\), \(QK^\top\) is an \(n \times n\) matrix.
+Every token computes a similarity score against every other token. This is the source of
 both the model's representational power and its cost. Because every pair of positions gets
 a direct, content-dependent interaction, the model can route information between any two
 tokens in a single layer regardless of how far apart they are, which is a big part of why
 Transformers are so good at in-context learning and long-range dependencies. But that same
-\(n \times n\) matrix means the compute and memory needed for one attention layer scale as
-\(O(n^2 d)\) and \(O(n^2)\) respectively — quadratic in sequence length. Double the context
-window and you quadruple the cost of every attention layer.
+\(n \times n\) matrix means the compute and memory needed for one attention layer scale quadratically in sequence length as
+\(O(n^2 d)\) and \(O(n^2)\) respectively.
 
 **Inference and the KV cache.** Training and prefill process a whole sequence at once, but
 autoregressive decoding generates one token at a time. Naively, generating token `n+1`
@@ -51,12 +50,11 @@ token generated and with every concurrent request served (see
 [Pope et al., "Efficiently Scaling Transformer Inference" (2022)](https://arxiv.org/abs/2211.05102)
 for a detailed treatment of this bottleneck).
 
-**A more realistic estimate.** Modern large models don't use plain multi-head attention —
-they use grouped-query attention (GQA,
+**A more realistic estimate.** Modern large models use grouped-query attention (GQA,
 [Ainslie et al., 2023](https://arxiv.org/abs/2305.13245)), where many query heads share a
 much smaller number of key/value heads, precisely to shrink the KV cache. Take a backbone
 with `128` layers, `d_model = 16384`, `128` query heads (`head_dim = 128`), but only `8`
-KV heads — an 16:1 GQA ratio similar to Llama 3's largest models — served in bf16:
+KV heads. A 16:1 GQA ratio similar to Llama 3's largest models served in bf16:
 
 $$
 \begin{aligned}
@@ -79,22 +77,19 @@ grows linearly and gets large fast for a single sequence:
 Numbers like these are why the KV cache, not the model weights, is usually the binding
 constraint when serving long-context requests at scale. It has to sit in the same HBM as
 the weights and activations, it grows with every token generated, and it multiplies with
-every concurrent request a server handles — a handful of 128K-context requests can
-already outweigh the memory the weights themselves occupy. Worse, in a naive
-implementation each request's cache is allocated as one contiguous block sized for the
-maximum sequence length, so memory gets fragmented and wasted whenever a request finishes
-early or sequences vary in length, capping how many requests can be batched together.
+every concurrent request a server handles. A handful of 128K-context requests can
+already outweigh the memory the weights themselves occupy.
 
 **PagedAttention** ([Kwon et al., 2023](https://arxiv.org/abs/2309.06180), the algorithm
 behind vLLM) targets exactly this allocation problem. A naive serving system reserves one
 contiguous chunk of memory per request sized for the maximum sequence length it might
-ever reach, up front — so a request that ends up short still ties up memory it never
+ever reach, up front. So, a request that ends early ties up memory it never
 uses, and that memory is wasted for the request's entire lifetime. PagedAttention instead
 allocates the KV cache in small fixed-size blocks on demand, one block at a time as the
 sequence actually grows, and uses a per-sequence block table to keep track of which
 physical blocks belong to which sequence. Nothing is reserved ahead of time, so no memory
 is wasted on requests that finish early, which lets the server pack many more sequences
-into a batch. What it does *not* do is change the fact that total cache size still grows
+into a batch. It does *not* change the fact that total cache size still grows
 linearly with sequence length; it just removes the wasted upfront reservation.
 
 **FlashAttention and its limits.** A lot of engineering effort has gone into making the
@@ -108,7 +103,7 @@ This is an IO-aware optimization: it doesn't change the \(O(n^2 d)\) FLOP count,
 removes the \(O(n^2)\) memory traffic to HBM that dominated wall-clock time, giving large
 real-world speedups and enabling longer context windows during training and prefill. What
 FlashAttention does **not** do is shrink the KV cache. The cache is a decode-time,
-per-request storage cost — it exists regardless of how efficiently a single attention
+per-request storage cost. It exists regardless of how efficiently a single attention
 matmul is computed, so even with FlashAttention the memory needed to serve long sequences
 still grows linearly and unboundedly with sequence length. Solving *that* problem requires
 rethinking the recurrence itself, which is where linear attention comes in.
@@ -132,7 +127,7 @@ $$
 where \(\mathrm{sim}(q_i, k_j) = \exp\!\left(q_i \cdot k_j / \sqrt{d}\right)\) in standard
 attention. Linear attention replaces this similarity with a kernel
 \(\mathrm{sim}(q, k) = \phi(q) \cdot \phi(k)\) for some (elementwise, positive) feature map
-\(\phi\) — the original paper uses \(\phi(x) = \mathrm{elu}(x) + 1\), and later work often
+\(\phi\). The original paper uses \(\phi(x) = \mathrm{elu}(x) + 1\), and later work often
 just uses \(\phi(x) = x\) or a simple nonlinearity. The key property is that this similarity
 function *factorizes*, so it can be pulled apart:
 
@@ -144,7 +139,7 @@ $$
 uncluttered.*
 
 **Why this matters: matmul associativity.** In matrix form, standard attention computes
-\((QK^\top)V\) — form the \(n \times n\) matrix \(QK^\top\) first, then multiply by \(V\). Because
+\((QK^\top)V\). Form the \(n \times n\) matrix \(QK^\top\) first, then multiply by \(V\). Because
 \(QK^\top\) is just an ordinary matrix product with no softmax in the way, matrix
 multiplication is associative and we're free to instead compute
 \(Q\big(K^\top V\big)\). The second grouping never materializes an
@@ -165,13 +160,353 @@ o_t &= q_t \cdot S_t \qquad\qquad\quad\ \text{(readout)}
 $$
 
 This is exactly the recurrence of an RNN, which is why the paper is titled "Transformers
-are RNNs" — a linear attention layer can run autoregressively by carrying a single fixed-size
+are RNNs". A linear attention layer can run autoregressively by carrying a single fixed-size
 state matrix \(S\) forward, rather than a cache of every past key and value. \(S\) has a fixed
 \(d \times d\) shape no matter how long the sequence gets, so decoding cost per step is
-constant and memory for the recurrent state doesn't grow with sequence length at all —
-precisely the KV cache problem from the previous section, solved by construction.
+constant and memory for the recurrent state doesn't grow with sequence length at all.
+
+Here's that recurrence running step by step on a toy example (\(d = 3\), 4 tokens):
+
+<div class="lka-anim" id="lka-anim">
+  <div class="lka-row">
+    <div class="lka-tokens" id="lka-tokens"></div>
+  </div>
+
+  <div class="lka-stage">
+    <div class="lka-col">
+      <div class="lka-label">\(k_t\)</div>
+      <div class="lka-vec lka-vcol lka-role-k" id="lka-k"></div>
+    </div>
+    <div class="lka-op">⊗</div>
+    <div class="lka-col">
+      <div class="lka-label">\(v_t^\top\)</div>
+      <div class="lka-vec lka-vrow lka-role-v" id="lka-v"></div>
+    </div>
+    <div class="lka-op">→</div>
+    <div class="lka-col">
+      <div class="lka-label">\(k_t v_t^\top\)</div>
+      <div class="lka-grid" id="lka-outer"></div>
+    </div>
+    <div class="lka-op lka-plus">+</div>
+    <div class="lka-col">
+      <div class="lka-label">\(S_{t-1}\)</div>
+      <div class="lka-grid" id="lka-prev"></div>
+    </div>
+    <div class="lka-op">=</div>
+    <div class="lka-col">
+      <div class="lka-label">\(S_t\)</div>
+      <div class="lka-grid" id="lka-state"></div>
+    </div>
+  </div>
+
+  <div class="lka-readout">
+    <span class="lka-label">readout&nbsp;</span>
+    <span>\(q_t = \)</span>
+    <span class="lka-vec lka-vrow lka-role-q" id="lka-q"></span>
+    <span>\(\ o_t = q_t \cdot S_t = \)</span>
+    <span class="lka-vec lka-vrow lka-role-o" id="lka-o"></span>
+  </div>
+
+  <div class="lka-controls">
+    <button id="lka-step">Step</button>
+    <button id="lka-play">Play</button>
+    <button id="lka-reset">Reset</button>
+    <span class="lka-caption" id="lka-caption">Click Step to process the first token.</span>
+  </div>
+</div>
+
+<style>
+.lka-anim {
+  --lka-k:       #2a78d6;
+  --lka-v:       #eb6834;
+  --lka-outer:   #1baf7a;
+  --lka-s:       #4a3aa7;
+  --lka-q:       #e87ba4;
+  --lka-o:       #008300;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--entry);
+  padding: 20px;
+  margin: 24px 0;
+  font-size: 0.9rem;
+  overflow-x: auto;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .lka-anim {
+    --lka-k:     #3987e5;
+    --lka-v:     #d95926;
+    --lka-outer: #199e70;
+    --lka-s:     #9085e9;
+    --lka-q:     #d55181;
+    --lka-o:     #0ca30c;
+  }
+}
+:root[data-theme="dark"] .lka-anim {
+  --lka-k:     #3987e5;
+  --lka-v:     #d95926;
+  --lka-outer: #199e70;
+  --lka-s:     #9085e9;
+  --lka-q:     #d55181;
+  --lka-o:     #0ca30c;
+}
+.lka-tokens { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.lka-token {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--secondary);
+  font-family: monospace;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.lka-token.lka-active {
+  background: var(--lka-k);
+  color: #fff;
+  border-color: var(--lka-k);
+}
+.lka-token.lka-done {
+  color: var(--content);
+  border-color: var(--tertiary);
+}
+.lka-stage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+  min-width: 560px;
+}
+.lka-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.lka-label { color: var(--secondary); font-size: 0.8rem; }
+.lka-op { font-size: 1.3rem; color: var(--secondary); }
+.lka-vec { display: flex; gap: 4px; }
+.lka-vcol { flex-direction: column; }
+.lka-cell {
+  width: 40px; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: monospace; font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--content);
+}
+.lka-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 40px);
+  grid-template-rows: repeat(3, 40px);
+  gap: 3px;
+}
+.lka-grid .lka-cell { transition: background-color 0.4s, color 0.4s, border-color 0.4s; }
+.lka-role-k .lka-cell { border-color: var(--lka-k); color: var(--lka-k); font-weight: 600; }
+.lka-role-v .lka-cell { border-color: var(--lka-v); color: var(--lka-v); font-weight: 600; }
+.lka-role-q .lka-cell { border-color: var(--lka-q); color: var(--lka-q); font-weight: 600; }
+.lka-role-o .lka-cell { border-color: var(--lka-o); color: var(--lka-o); font-weight: 600; }
+.lka-readout {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.lka-controls {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.lka-controls button {
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--content);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.lka-controls button:hover { border-color: var(--lka-k); }
+.lka-caption { color: var(--secondary); font-size: 0.82rem; }
+</style>
+
+<script>
+(function () {
+  const K = [[1, 0.3, 0], [0.2, 1, 0.4], [0, 0.5, 1], [0.6, 0.1, 0.2]];
+  const V = [[0.8, 0, 0.2], [0.1, 0.9, 0], [0.3, 0.2, 0.7], [0.5, 0.4, 0.1]];
+  const Q = [[0.7, 0.5, 0.9], [0.4, 0.8, 0.2], [0.9, 0.1, 0.5], [0.3, 0.6, 0.7]];
+  const n = K.length, d = 3;
+
+  let t = 0;
+  let S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  let playing = false, timer = null;
+
+  const el = (id) => document.getElementById(id);
+  const fmt = (x) => x.toFixed(2);
+
+  function renderTokens() {
+    const c = el('lka-tokens');
+    c.innerHTML = '';
+    for (let i = 0; i < n; i++) {
+      const s = document.createElement('span');
+      s.className = 'lka-token' + (i === t ? ' lka-active' : i < t ? ' lka-done' : '');
+      s.textContent = 'token ' + (i + 1);
+      c.appendChild(s);
+    }
+  }
+
+  function renderVec(id, vec, dir) {
+    const c = el(id);
+    c.classList.toggle('lka-vcol', dir === 'col');
+    c.classList.toggle('lka-vrow', dir !== 'col');
+    c.innerHTML = '';
+    vec.forEach((x) => {
+      const cell = document.createElement('div');
+      cell.className = 'lka-cell';
+      cell.textContent = fmt(x);
+      c.appendChild(cell);
+    });
+  }
+
+  function renderGrid(id, mat, hueVar) {
+    const c = el(id);
+    c.innerHTML = '';
+    for (let r = 0; r < d; r++) {
+      for (let col = 0; col < d; col++) {
+        const cell = document.createElement('div');
+        cell.className = 'lka-cell';
+        const val = mat[r][col];
+        cell.textContent = fmt(val);
+        const alpha = Math.min(Math.abs(val) / 2.5, 1);
+        cell.style.background = `color-mix(in srgb, var(${hueVar}) ${Math.round(alpha * 55)}%, var(--code-bg))`;
+        cell.style.borderColor = `color-mix(in srgb, var(${hueVar}) ${Math.round(alpha * 70 + 15)}%, var(--border))`;
+        c.appendChild(cell);
+      }
+    }
+  }
+
+  function dot(vec, mat) {
+    const out = [0, 0, 0];
+    for (let col = 0; col < d; col++) {
+      let s = 0;
+      for (let r = 0; r < d; r++) s += vec[r] * mat[r][col];
+      out[col] = s;
+    }
+    return out;
+  }
+
+  function render() {
+    renderTokens();
+    if (t < n) {
+      renderVec('lka-k', K[t], 'col');
+      renderVec('lka-v', V[t], 'row');
+      const outerMat = [];
+      for (let r = 0; r < d; r++) {
+        const row = [];
+        for (let c = 0; c < d; c++) row.push(K[t][r] * V[t][c]);
+        outerMat.push(row);
+      }
+      renderGrid('lka-outer', outerMat, '--lka-outer');
+    } else {
+      el('lka-k').innerHTML = '';
+      el('lka-v').innerHTML = '';
+      renderGrid('lka-outer', [[0,0,0],[0,0,0],[0,0,0]], '--lka-outer');
+    }
+    renderGrid('lka-prev', S.map(row => row.slice()), '--lka-s');
+    const Snext = t < n ? addOuter(S, K[t], V[t]) : S;
+    renderGrid('lka-state', Snext, '--lka-s');
+    const qIdx = Math.min(t, n - 1);
+    renderVec('lka-q', Q[qIdx], 'row');
+    renderVec('lka-o', dot(Q[qIdx], Snext), 'row');
+    el('lka-caption').textContent =
+      t >= n
+        ? `Done —> processed all ${n} tokens with a fixed ${d}x${d} state, no growing cache.`
+        : `Step ${t + 1} of ${n}: add token ${t + 1}'s outer product k_t v_t^⊺ into S, then read out o_t = q_t · S_t.`;
+  }
+
+  function addOuter(mat, k, v) {
+    const out = [];
+    for (let r = 0; r < d; r++) {
+      const row = [];
+      for (let c = 0; c < d; c++) row.push(mat[r][c] + k[r] * v[c]);
+      out.push(row);
+    }
+    return out;
+  }
+
+  function step() {
+    if (t >= n) return;
+    S = addOuter(S, K[t], V[t]);
+    t += 1;
+    render();
+    if (t >= n) stop();
+  }
+
+  function reset() {
+    stop();
+    t = 0;
+    S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    render();
+  }
+
+  function stop() {
+    playing = false;
+    el('lka-play').textContent = 'Play';
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  el('lka-step').addEventListener('click', step);
+  el('lka-reset').addEventListener('click', reset);
+  el('lka-play').addEventListener('click', function () {
+    if (playing) { stop(); return; }
+    playing = true;
+    el('lka-play').textContent = 'Pause';
+    timer = setInterval(() => {
+      if (t >= n) { stop(); return; }
+      step();
+    }, 1400);
+  });
+
+  render();
+})();
+</script>
+
 
 ## Intuition: What Linear Attention Actually Does
+
+**Fast weight programming.** The recurrence from the previous section:
+\(S_t = S_{t-1} + k_t v_t^\top\), \(o_t = q_t \cdot S_t\) - is an instance of an old idea
+called *fast weight programming*
+([Schmidhuber, 1992](https://ieeexplore.ieee.org/document/6796337); see also
+[Schlag, Irie & Schmidhuber, "Linear Transformers Are Secretly Fast Weight Programmers"
+(2021)](https://arxiv.org/abs/2102.11174), which makes the connection to linear attention
+explicit). 
+
+A normal linear layer applies a weight matrix that was fixed at training time
+by gradient descent. Those are *slow* weights, updated once every training step, the same
+for every input at inference. \(S\) is different: it's a weight matrix that gets rewritten
+*at every token, during inference itself*. Each step performs an outer-product ("Hebbian")
+write \(k_t v_t^\top\) into \(S\), associating key \(k_t\) with value \(v_t\), and then a query
+\(q_t\) *reads* from that same matrix via an ordinary matrix-vector product \(q_t \cdot S_t\). \(S\) is the fast weight
+matrix being written, and \(q_t \cdot S_t\) is that fast weight matrix being executed.
+
+**The trade-off: compression.** Standard attention keeps every past key and value around
+individually. \(n\) separate vectors, so a query can retrieve whichever one it's most
+similar to with no interference from the rest. Linear attention throws that away and keeps
+only the running sum \(S = \sum_j k_j v_j^\top\), a single \(d \times d\) matrix whose size
+never grows. The KV cache size problem now disappears because
+the information that used to occupy \(O(n)\) memory is now being folded into a memory of
+fixed capacity, \(O(d^2)\). A
+query \(q_t\) reading from \(S_t\) doesn't get back one clean value; it gets a weighted blend
+of every value ever written, weighted by how much each past key resembles \(q_t\) — including
+keys that are only accidentally similar. Early tokens are especially at risk: their
+contribution to \(S\) never gets removed or refreshed, it just keeps getting summed over and
+diluted by everything written after it. Standard attention's softmax gives it a sharp,
+content-addressed lookup over an ever-growing exact memory; linear attention trades that
+sharpness for a fixed-size memory that must approximate, and slowly forgets by dilution
+rather than by any deliberate mechanism.
+
+That last part is the real problem: vanilla linear attention has no way to *decide* what to
+keep and what to overwrite. The next two sections fix that, first by
+letting each token's write selectively erase what's already in \(S\) (the delta rule), and
+then by adding an explicit forget gate on top of that (the gated delta rule).
 
 ## The Delta Update Rule
 
