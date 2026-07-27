@@ -144,7 +144,7 @@ uncluttered.*
 multiplication is associative and we're free to instead compute
 \(Q\big(K^\top V\big)\). The second grouping never materializes an
 \(n \times n\) matrix at all: \(K^\top V\) is a \(d \times d\) matrix (summed over all \(n\)
-tokens), and \(Q\) times that is \(O(n d^2)\) — **linear** in sequence length instead of
+tokens), and \(Q\) times that is \(O(n d^2)\), **linear** in sequence length instead of
 quadratic.
 
 **The recurrent, constant-memory form.** Let's take a closer look at what linear attention
@@ -417,7 +417,7 @@ Here's that recurrence running step by step on a toy example (\(d = 3\), 4 token
     renderVec('lka-o', dot(Q[qIdx], Snext), 'row');
     el('lka-caption').textContent =
       t >= n
-        ? `Done —> processed all ${n} tokens with a fixed ${d}x${d} state, no growing cache.`
+        ? `Done. Processed all ${n} tokens with a fixed ${d}x${d} state, no growing cache.`
         : `Step ${t + 1} of ${n}`;
   }
 
@@ -481,8 +481,8 @@ x^\top S = \sum_j (x \cdot k_j)\, v_j^\top
 $$
 
 If \(x\) happens to line up closely with some earlier key \(k_j\) (and not with the others),
-this returns something close to that key's stored value \(v_j^\top\) — a genuine lookup. If
-\(x\) is orthogonal to everything written so far, it returns close to zero — nothing is
+this returns something close to that key's stored value \(v_j^\top\): a genuine lookup. If
+\(x\) is orthogonal to everything written so far, it returns close to zero: nothing is
 stored along that direction yet. This is what makes \(S\)
 resemble the short term memory of the network. It contains everything the network
 remembers so far, all superimposed into one fixed-size matrix.
@@ -512,7 +512,7 @@ never grows. The KV cache size problem now disappears because
 the information that used to occupy \(O(n)\) memory is now being folded into a memory of
 fixed capacity, \(O(d^2)\). A
 query \(q_t\) reading from \(S_t\) doesn't get back one clean value; it gets a weighted blend
-of every value ever written, weighted by how much each past key resembles \(q_t\) — including
+of every value ever written, weighted by how much each past key resembles \(q_t\), including
 keys that are only accidentally similar. Early tokens are especially at risk: their
 contribution to \(S\) never gets removed or refreshed, it just keeps getting summed over and
 diluted by everything written after it. Standard attention's softmax gives it a sharp,
@@ -542,7 +542,7 @@ S_t &= S_{t-1} + \beta_t\, k_t\, (v_t - \bar v_t)^\top
 $$
 
 where \(\beta_t \in (0, 1)\) is a per-token, learned scalar controlling how aggressively to
-overwrite — typically a sigmoid of a linear projection of the input, so the model decides
+overwrite, typically a sigmoid of a linear projection of the input, so the model decides
 token by token how much to trust the new value over what's already stored. There are two
 different ways to understand why this works.
 
@@ -556,8 +556,8 @@ $$
 The term \(I - \beta_t k_t k_t^\top\) acts on \(S_{t-1}\) *before* anything new is added: it
 removes a \(\beta_t\)-fraction of whatever \(S_{t-1}\) currently outputs along the direction
 \(k_t\), and only then is the fresh association \(\beta_t k_t v_t^\top\) written in. So
-instead of the new outer product piling on top of the old one — as in plain linear attention
-— the delta rule first *makes room* for it. Write the same key twice with \(\beta_t = 1\) and
+instead of the new outer product piling on top of the old one, as in plain linear attention,
+the delta rule first *makes room* for it. Write the same key twice with \(\beta_t = 1\) and
 the second write fully overwrites the first rather than blending with it. Overwrite instead
 of interference is exactly the "forget" operation the
 [intuition](#intuition-what-linear-attention-actually-does) section found missing from
@@ -578,11 +578,11 @@ $$
 S_t = S_{t-1} - \beta_t \nabla_S \mathcal{L}_t = S_{t-1} + \beta_t\, k_t\, (v_t - \bar v_t)^\top
 $$
 
-— identical to the update above. This is, literally, the classical delta rule / Widrow-Hoff
+This is identical to the update above. This is, literally, the classical delta rule / Widrow-Hoff
 LMS rule from adaptive filtering: adjust weights in proportion to the *prediction error*
 \((v_t - \bar v_t)\), not just the raw correlation between input and target. Seen this way,
 vanilla linear attention's Hebbian update \(S_t = S_{t-1} + k_t v_t^\top\) is what falls out
-of the same setup with no error-correction term at all — it always writes the full \(v_t\)
+of the same setup with no error-correction term at all: it always writes the full \(v_t\)
 regardless of what \(S\) already predicts, so it can never fix a stale or wrong association,
 only bury it under new ones. The delta rule instead turns \(S\) into memory that is actually
 *trained*, one token at a time, rather than memory that only ever accumulates.
@@ -590,13 +590,109 @@ only bury it under new ones. The delta rule instead turns \(S\) into memory that
 Both views describe the exact same arithmetic; Either way, \(S\) keeps the same fixed \(d \times d\) size and
 \(O(d^2)\) per-token cost as plain linear attention during decode, but it can now edit, not just append.
 What it still can't do is decide to forget an association wholesale, independent of whether
-the current token happens to write a similar key — that's what the explicit gate in the next
+the current token happens to write a similar key; that's what the explicit gate in the next
 section adds.
 
 ## The Gated Delta Update Rule
 
-<!-- Cite: Yang et al., "Gated Delta Networks: Improving Mamba2 with Delta Rule" (2024) -->
+**What the delta rule still can't do.** The delta rule's erase term,
+\(I - \beta_t k_t k_t^\top\), only removes information along the direction of the *current*
+key \(k_t\). That's precise: it edits exactly the association a new write would otherwise
+collide with, but it's also narrow. If the model wants to wipe the slate more broadly (say,
+at a topic or document boundary, where everything written so far has simply gone stale,
+regardless of whether any of it resembles the current token's key) the delta rule has no way
+to express that. It can only ever erase what the current key happens to point at.
+
+**Adding a global forget gate.** Gated DeltaNet
+([Yang, Kautz & Hatamizadeh, 2024](https://arxiv.org/abs/2412.06464)) fixes this by borrowing
+the other half of the story from gated linear attention and Mamba2
+([Dao & Gu, 2024](https://arxiv.org/abs/2405.21060)): a data-dependent scalar decay
+\(\alpha_t \in (0, 1)\), produced by the model from the current token, that uniformly shrinks
+*all* of \(S_{t-1}\), every stored association, not just the ones near \(k_t\), before the
+delta-rule write happens:
+
+$$
+S_t = S_{t-1}\big(\alpha_t (I - \beta_t k_t k_t^\top)\big) + \beta_t k_t v_t^\top
+$$
+
+\(\alpha_t\) and \(\beta_t\) are two independent, learned, per-token gates with different
+jobs. \(\alpha_t\) is content-*independent* forgetting: it can decay the entire state toward
+zero regardless of what's currently being written, giving the model a cheap way to say "start
+fresh" or gradually fade out old context. \(\beta_t\) is content-*addressed* editing: it
+overwrites whatever is specifically associated with \(k_t\), leaving everything else alone.
+Vanilla linear attention has neither: it can only append. The plain delta rule has the
+second but not the first: it can correct, but can't wholesale forget. Gated DeltaNet has
+both, and they're complementary: \(\alpha_t\) decides how much of the *past, in general* to
+keep, and \(\beta_t\) decides how much of *this specific association* to overwrite.
+
+**Same fast-weight picture, richer control.** Nothing about the fast-weight-programming or
+memory-compression trade-off from the [intuition](#intuition-what-linear-attention-actually-does)
+section changes: \(S\) is still a fixed \(d \times d\) matrix, updated in \(O(d^2)\) per
+token, still just a linear map you probe with a query. What's changed is how much say the
+model has over what stays in that matrix: not just adding new associations (vanilla linear
+attention), and not just correcting the one association a new key happens to collide with
+(the delta rule), but also, independently on every token, deciding how aggressively to let
+the whole memory fade. The gated delta rule is what the rest of this post's Gated DeltaNet
+architecture is actually built on.
 
 ## Putting It Together: Gated DeltaNet
+
+Everything so far has been about a single recurrence, \(S_t = S_{t-1}\big(\alpha_t(I -
+\beta_t k_t k_t^\top)\big) + \beta_t k_t v_t^\top\), acting on one head's worth of keys,
+values, and queries. Turning that into an actual layer you can drop into a Transformer needs
+a few more pieces, all fairly standard in this line of work.
+
+**Multiple heads, each with its own memory.** Just like standard multi-head attention,
+Gated DeltaNet splits \(q_t, k_t, v_t\) into \(H\) heads of dimension \(d_{head}\) and runs
+the recurrence independently per head, each maintaining its own \(d_{head} \times d_{head}\)
+state matrix \(S^{(h)}\). Smaller, more numerous memories turn out to matter for
+expressiveness: a single \(d \times d\) matrix has only so much capacity before superposition
+starts to hurt (recall the [compression trade-off](#intuition-what-linear-attention-actually-does)
+from earlier), and splitting into heads is the same fix multi-head attention already uses for
+a different reason: many smaller, independent subspaces instead of one large shared one.
+
+**A short convolution before the recurrence.** Before \(q_t, k_t, v_t\) enter the recurrence,
+Gated DeltaNet (following GLA, [Yang, Wang, Shen, Panda & Kim,
+2023](https://arxiv.org/abs/2312.06635), and Mamba) passes them through a short causal
+depthwise convolution, a kernel width of about 4 tokens. The recurrence itself has no
+built-in notion of local order beyond what \(S\) accumulates; a few positions of local
+convolutional context ahead of time gives each token's key and value a cheap, local n-gram
+signal to work with, which empirically matters a lot for tasks like copying and induction
+that hinge on nearby token patterns.
+
+**Normalization for a stable recurrence.** \(q_t\) and \(k_t\) are \(L_2\)-normalized before
+use. This isn't cosmetic: the erase term \(I - \beta_t k_t k_t^\top\) is only guaranteed to be
+a contraction (i.e., not blow up the state over thousands of steps) when \(k_t\) has unit
+norm and \(\beta_t \in (0, 1)\). Without normalization, a recurrence run over a long sequence
+has every opportunity to drift; keeping \(k_t\) on the unit sphere is what keeps \(S\) from
+exploding or decaying pathologically over long contexts.
+
+**An output gate.** After the readout \(o_t = q_t^\top S_t\), the layer applies one more
+gate: an elementwise SiLU/sigmoid gate computed from the input, multiplied into \(o_t\)
+before the final output projection, the same device GLA and Mamba2 use. It lets the layer
+suppress its output on tokens where reading from memory isn't useful, independent of what
+\(\alpha_t\) and \(\beta_t\) decided to do to \(S\) itself.
+
+**Training in parallel despite the recurrence.** Written as above, computing \(S_t\)
+requires \(S_{t-1}\), which requires \(S_{t-2}\), and so on: a strictly sequential chain
+that would make training on a full sequence painfully slow if run one token at a time on a
+GPU or TPU. Both DeltaNet and Gated DeltaNet solve this the same way: split the sequence
+into fixed-size chunks, and within each chunk, use a matrix identity (a "WY representation,"
+borrowed from Householder QR factorization) to express the chunk's entire sequence of erase-
+and-write updates as a handful of dense matmuls instead of a token-by-token loop. Only the
+state handoff *between* chunks is sequential (dozens of chunks rather than thousands of
+tokens), which is enough to make the whole thing run efficiently on the same hardware that
+makes FlashAttention fast, without giving up the fixed-size state at inference time.
+
+**Where this lands.** Gated DeltaNet consistently beats both of the mechanisms it combines: Mamba2 (gating alone) and plain DeltaNet
+(the delta rule alone), on language modeling
+perplexity, in-context retrieval, length extrapolation, and long-context benchmarks. It still
+inherits linear attention's core trade-off from the [intuition](#intuition-what-linear-attention-actually-does)
+section: a fixed-size state is a compressed, lossy summary of the past, and no amount of
+gating or delta-rule editing changes that asymptotically. What gating and the delta rule buy
+back is *control* over that compression: deciding, every token, what's worth keeping, which
+in practice closes most of the gap to full attention while keeping the KV-cache-free,
+constant-memory decoding that motivated this whole detour away from softmax attention in the
+first place.
 
 ## What's Next
