@@ -473,7 +473,7 @@ Here's that recurrence running step by step on a toy example (\(d = 3\), 4 token
 
 **\(S\) as the network's short term memory.** Before going further, it's worth being precise about what the recurrence state
 \(S\) represents.  \(S = \sum_j k_j v_j^\top\) is a sum of outer
-products, one per token seen so far. Multiply a vector \(x\) through it and the sum unpacks
+products, one per token seen so far. Multiply a unit vector \(x\) through it and the sum unpacks
 into a similarity-weighted combination of every value ever written:
 
 $$
@@ -536,7 +536,7 @@ with \(k_t\), and partially update it with the *difference* of new and old value
 
 $$
 \begin{aligned}
-\bar v_t &= S_{t-1}^\top k_t \qquad \text{(what $S$ currently says $k_t$ maps to)}\\[4pt]
+\bar v_t &= S_{t-1}^\top k_t \qquad \text{(look up $k_t$ in the existing memory)}\\[4pt]
 S_t &= S_{t-1} + \beta_t\, k_t\, (v_t - \bar v_t)^\top
 \end{aligned}
 $$
@@ -621,19 +621,7 @@ zero regardless of what's currently being written, giving the model a cheap way 
 fresh" or gradually fade out old context. \(\beta_t\) is content-*addressed* editing: it
 overwrites whatever is specifically associated with \(k_t\), leaving everything else alone.
 Vanilla linear attention has neither: it can only append. The plain delta rule has the
-second but not the first: it can correct, but can't wholesale forget. Gated DeltaNet has
-both, and they're complementary: \(\alpha_t\) decides how much of the *past, in general* to
-keep, and \(\beta_t\) decides how much of *this specific association* to overwrite.
-
-**Same fast-weight picture, richer control.** Nothing about the fast-weight-programming or
-memory-compression trade-off from the [intuition](#intuition-what-linear-attention-actually-does)
-section changes: \(S\) is still a fixed \(d \times d\) matrix, updated in \(O(d^2)\) per
-token, still just a linear map you probe with a query. What's changed is how much say the
-model has over what stays in that matrix: not just adding new associations (vanilla linear
-attention), and not just correcting the one association a new key happens to collide with
-(the delta rule), but also, independently on every token, deciding how aggressively to let
-the whole memory fade. The gated delta rule is what the rest of this post's Gated DeltaNet
-architecture is actually built on.
+second but not the first: it can correct, but can't wholesale forget. Gated DeltaNet has both.
 
 ## Putting It Together: Gated DeltaNet
 
@@ -641,6 +629,170 @@ Everything so far has been about a single recurrence, \(S_t = S_{t-1}\big(\alpha
 \beta_t k_t k_t^\top)\big) + \beta_t k_t v_t^\top\), acting on one head's worth of keys,
 values, and queries. Turning that into an actual layer you can drop into a Transformer needs
 a few more pieces, all fairly standard in this line of work.
+
+<div class="gdn-arch">
+  <div class="gdn-title">Gated DeltaNet layer &mdash; one head, one token</div>
+
+  <div class="gdn-box gdn-x">\(x_t\)</div>
+  <div class="gdn-arrow">projections</div>
+
+  <div class="gdn-row">
+    <div class="gdn-box gdn-q">\(q_t\)</div>
+    <div class="gdn-box gdn-k">\(k_t\)</div>
+    <div class="gdn-box gdn-v">\(v_t\)</div>
+    <div class="gdn-gaterow">
+      <div class="gdn-box gdn-alpha">\(\alpha_t\)</div>
+      <div class="gdn-box gdn-beta">\(\beta_t\)</div>
+    </div>
+  </div>
+  <div class="gdn-caption">short causal conv on \(q,k,v\) &nbsp;&middot;&nbsp; \(L_2\)-normalize \(q_t, k_t\) &nbsp;&middot;&nbsp; \(\alpha_t,\beta_t\) are scalar gates from \(x_t\)</div>
+
+  <div class="gdn-arrow">↓</div>
+
+  <div class="gdn-recurrence">
+    <div class="gdn-state-row">
+      <div class="gdn-box gdn-s">\(S_{t-1}\)</div>
+      <div class="gdn-update">
+        \(S_t = S_{t-1}\big(\alpha_t(I - \beta_t k_t k_t^\top)\big) + \beta_t k_t v_t^\top\)
+      </div>
+      <div class="gdn-box gdn-s">\(S_t\)</div>
+    </div>
+    <div class="gdn-loopback">↺ carried forward as \(S_{t-1}\) for the next token</div>
+  </div>
+
+  <div class="gdn-arrow">readout \(o_t = q_t^\top S_t\)</div>
+  <div class="gdn-box gdn-o">\(o_t\)</div>
+
+  <div class="gdn-arrow">× SiLU output gate\((x_t)\)</div>
+  <div class="gdn-arrow">concat \(H\) heads → output projection</div>
+
+  <div class="gdn-box gdn-y">\(y_t\)</div>
+  <div class="gdn-arrow gdn-residual">+ \(x_t\) (residual)</div>
+</div>
+
+<style>
+.gdn-arch {
+  --gdn-x:     #898781;
+  --gdn-q:     #e87ba4;
+  --gdn-k:     #2a78d6;
+  --gdn-v:     #eb6834;
+  --gdn-alpha: #eda100;
+  --gdn-beta:  #e34948;
+  --gdn-s:     #4a3aa7;
+  --gdn-o:     #008300;
+  --gdn-y:     #898781;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--entry);
+  padding: 24px 20px;
+  margin: 24px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.88rem;
+  overflow-x: auto;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .gdn-arch {
+    --gdn-q:     #d55181;
+    --gdn-k:     #3987e5;
+    --gdn-v:     #d95926;
+    --gdn-alpha: #c98500;
+    --gdn-beta:  #e66767;
+    --gdn-s:     #9085e9;
+    --gdn-o:     #0ca30c;
+  }
+}
+:root[data-theme="dark"] .gdn-arch {
+  --gdn-q:     #d55181;
+  --gdn-k:     #3987e5;
+  --gdn-v:     #d95926;
+  --gdn-alpha: #c98500;
+  --gdn-beta:  #e66767;
+  --gdn-s:     #9085e9;
+  --gdn-o:     #0ca30c;
+}
+.gdn-title {
+  color: var(--secondary);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+}
+.gdn-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.gdn-gaterow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 18px;
+  padding-left: 18px;
+  border-left: 1px dashed var(--border);
+}
+.gdn-caption {
+  color: var(--secondary);
+  font-size: 0.75rem;
+  text-align: center;
+  max-width: 640px;
+  margin: 4px 0 2px;
+}
+.gdn-box {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--content);
+  font-family: monospace;
+  white-space: nowrap;
+}
+.gdn-x, .gdn-y { border-color: var(--tertiary); }
+.gdn-q     { border-color: var(--gdn-q); color: var(--gdn-q); font-weight: 600; }
+.gdn-k     { border-color: var(--gdn-k); color: var(--gdn-k); font-weight: 600; }
+.gdn-v     { border-color: var(--gdn-v); color: var(--gdn-v); font-weight: 600; }
+.gdn-alpha { border-color: var(--gdn-alpha); color: var(--gdn-alpha); font-weight: 600; }
+.gdn-beta  { border-color: var(--gdn-beta); color: var(--gdn-beta); font-weight: 600; }
+.gdn-s     { border-color: var(--gdn-s); color: var(--gdn-s); font-weight: 600; }
+.gdn-o     { border-color: var(--gdn-o); color: var(--gdn-o); font-weight: 600; }
+.gdn-arrow {
+  color: var(--secondary);
+  font-size: 0.78rem;
+  padding: 2px 0;
+}
+.gdn-residual { margin-top: 2px; }
+.gdn-recurrence {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  padding: 14px 18px;
+  border: 1px dashed var(--gdn-s);
+  border-radius: 8px;
+}
+.gdn-state-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.gdn-update {
+  font-size: 0.82rem;
+  color: var(--content);
+  text-align: center;
+}
+.gdn-loopback {
+  color: var(--gdn-s);
+  font-size: 0.75rem;
+}
+</style>
+
 
 **Multiple heads, each with its own memory.** Just like standard multi-head attention,
 Gated DeltaNet splits \(q_t, k_t, v_t\) into \(H\) heads of dimension \(d_{head}\) and runs
@@ -673,17 +825,6 @@ before the final output projection, the same device GLA and Mamba2 use. It lets 
 suppress its output on tokens where reading from memory isn't useful, independent of what
 \(\alpha_t\) and \(\beta_t\) decided to do to \(S\) itself.
 
-**Training in parallel despite the recurrence.** Written as above, computing \(S_t\)
-requires \(S_{t-1}\), which requires \(S_{t-2}\), and so on: a strictly sequential chain
-that would make training on a full sequence painfully slow if run one token at a time on a
-GPU or TPU. Both DeltaNet and Gated DeltaNet solve this the same way: split the sequence
-into fixed-size chunks, and within each chunk, use a matrix identity (a "WY representation,"
-borrowed from Householder QR factorization) to express the chunk's entire sequence of erase-
-and-write updates as a handful of dense matmuls instead of a token-by-token loop. Only the
-state handoff *between* chunks is sequential (dozens of chunks rather than thousands of
-tokens), which is enough to make the whole thing run efficiently on the same hardware that
-makes FlashAttention fast, without giving up the fixed-size state at inference time.
-
 **Where this lands.** Gated DeltaNet consistently beats both of the mechanisms it combines: Mamba2 (gating alone) and plain DeltaNet
 (the delta rule alone), on language modeling
 perplexity, in-context retrieval, length extrapolation, and long-context benchmarks. It still
@@ -696,3 +837,16 @@ constant-memory decoding that motivated this whole detour away from softmax atte
 first place.
 
 ## What's Next
+
+Everything above describes Gated DeltaNet token by token, the way it actually runs during decoding. Computing \(S_t\) requires \(S_{t-1}\), which requires
+\(S_{t-2}\), and so on. Training the model sequentially on each 
+individual token is painfully slow. Both DeltaNet and Gated
+DeltaNet get around this with a chunkwise-parallel form: split the sequence into fixed-size chunks, and within each chunk, use a matrix identity (a "WY representation") to express the chunk's entire sequence of erase-and-write
+updates as a handful of dense matmuls instead of a token-by-token loop, leaving only the state handoff *between* chunks sequential.
+
+The chunkwise algorithm is a pretty neat idea: it turns an inherently sequential recurrence
+into a handful of matmuls without changing what it computes, which is what makes Gated
+DeltaNet practical to train on GPUs and TPUs in the first place. It's also hard to grasp by
+just reading existing implementations, since the kernels are written for throughput, not for
+following the derivation step by step. The next post will break down how the WY
+representation makes this possible, one step at a time.
