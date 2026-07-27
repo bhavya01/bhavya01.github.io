@@ -148,14 +148,14 @@ tokens), and \(Q\) times that is \(O(n d^2)\) — **linear** in sequence length 
 quadratic.
 
 **The recurrent, constant-memory form.** Let's take a closer look at what linear attention
-is doing by looking at how we process tokens one at a time during decode. The
-\(d \times d\) matrix \(S = K^\top V\) is just a sum of rank-1 outer products,
+is doing by looking at how we process tokens one at a time during decode. In the product
+\(Q(K^\top V)\), the \(d \times d\) matrix \(S = K^\top V\) is just a sum of rank-1 outer products,
 \(S = \sum_j k_j\, v_j^\top\), which means it can be built up one token at a time:
 
 $$
 \begin{aligned}
 S_t &= S_{t-1} + k_t\, v_t^\top \qquad \text{(state update, }S\text{ is }d \times d\text{)}\\[4pt]
-o_t &= q_t \cdot S_t \qquad\qquad\quad\ \text{(readout)}
+o_t &= q_t^\top S_t \qquad\qquad\quad\ \text{(readout)}
 \end{aligned}
 $$
 
@@ -201,9 +201,9 @@ Here's that recurrence running step by step on a toy example (\(d = 3\), 4 token
 
   <div class="lka-readout">
     <span class="lka-label">readout&nbsp;</span>
-    <span>\(q_t = \)</span>
+    <span>\(q_t^\top = \)</span>
     <span class="lka-vec lka-vrow lka-role-q" id="lka-q"></span>
-    <span>\(\ o_t = q_t \cdot S_t = \)</span>
+    <span>\(\ o_t = q_t^\top S_t = \)</span>
     <span class="lka-vec lka-vrow lka-role-o" id="lka-o"></span>
   </div>
 
@@ -418,7 +418,7 @@ Here's that recurrence running step by step on a toy example (\(d = 3\), 4 token
     el('lka-caption').textContent =
       t >= n
         ? `Done —> processed all ${n} tokens with a fixed ${d}x${d} state, no growing cache.`
-        : `Step ${t + 1} of ${n}: add token ${t + 1}'s outer product k_t v_t^⊺ into S, then read out o_t = q_t · S_t.`;
+        : `Step ${t + 1} of ${n}`;
   }
 
   function addOuter(mat, k, v) {
@@ -471,8 +471,25 @@ Here's that recurrence running step by step on a toy example (\(d = 3\), 4 token
 
 ## Intuition: What Linear Attention Actually Does
 
+**\(S\) as the network's short term memory.** Before going further, it's worth being precise about what the recurrence state
+\(S\) represents.  \(S = \sum_j k_j v_j^\top\) is a sum of outer
+products, one per token seen so far. Multiply a vector \(x\) through it and the sum unpacks
+into a similarity-weighted combination of every value ever written:
+
+$$
+x^\top S = \sum_j (x \cdot k_j)\, v_j^\top
+$$
+
+If \(x\) happens to line up closely with some earlier key \(k_j\) (and not with the others),
+this returns something close to that key's stored value \(v_j^\top\) — a genuine lookup. If
+\(x\) is orthogonal to everything written so far, it returns close to zero — nothing is
+stored along that direction yet. This is what makes \(S\)
+resemble the short term memory of the network. It contains everything the network
+remembers so far, all superimposed into one fixed-size matrix.
+
+
 **Fast weight programming.** The recurrence from the previous section:
-\(S_t = S_{t-1} + k_t v_t^\top\), \(o_t = q_t \cdot S_t\) - is an instance of an old idea
+\(S_t = S_{t-1} + k_t v_t^\top\), \(o_t = q_t^\top S_t\) - is an instance of an old idea
 called *fast weight programming*
 ([Schmidhuber, 1992](https://ieeexplore.ieee.org/document/6796337); see also
 [Schlag, Irie & Schmidhuber, "Linear Transformers Are Secretly Fast Weight Programmers"
@@ -484,8 +501,8 @@ by gradient descent. Those are *slow* weights, updated once every training step,
 for every input at inference. \(S\) is different: it's a weight matrix that gets rewritten
 *at every token, during inference itself*. Each step performs an outer-product ("Hebbian")
 write \(k_t v_t^\top\) into \(S\), associating key \(k_t\) with value \(v_t\), and then a query
-\(q_t\) *reads* from that same matrix via an ordinary matrix-vector product \(q_t \cdot S_t\). \(S\) is the fast weight
-matrix being written, and \(q_t \cdot S_t\) is that fast weight matrix being executed.
+\(q_t\) *reads* from that same matrix via an ordinary matrix-vector product \(q_t^\top S_t\). \(S\) is the fast weight
+matrix being written, and \(q_t^\top S_t\) is that fast weight matrix being executed.
 
 **The trade-off: compression.** Standard attention keeps every past key and value around
 individually. \(n\) separate vectors, so a query can retrieve whichever one it's most
@@ -510,7 +527,71 @@ then by adding an explicit forget gate on top of that (the gated delta rule).
 
 ## The Delta Update Rule
 
-<!-- Cite: Yang et al., "Parallelizing Linear Transformers with the Delta Rule over Sequence Length" (2024) -->
+Vanilla linear attention only ever adds to \(S\): \(S_t = S_{t-1} + k_t v_t^\top\). Nothing is
+ever selectively removed, so two tokens that write similar keys interfere in \(S\) forever. The delta rule (DeltaNet,
+[Yang, Wang, Zhang, Shen & Kim, 2024](https://arxiv.org/abs/2406.06484), building on
+[Schlag, Irie & Schmidhuber, 2021](https://arxiv.org/abs/2102.11174)) fixes this with one
+extra step: before writing \(v_t\), read out whatever value \(S_{t-1}\) currently associates
+with \(k_t\), and partially update it with the *difference* of new and old value, controlled by parameter \(\beta_t\)
+
+$$
+\begin{aligned}
+\bar v_t &= S_{t-1}^\top k_t \qquad \text{(what $S$ currently says $k_t$ maps to)}\\[4pt]
+S_t &= S_{t-1} + \beta_t\, k_t\, (v_t - \bar v_t)^\top
+\end{aligned}
+$$
+
+where \(\beta_t \in (0, 1)\) is a per-token, learned scalar controlling how aggressively to
+overwrite — typically a sigmoid of a linear projection of the input, so the model decides
+token by token how much to trust the new value over what's already stored. There are two
+different ways to understand why this works.
+
+**View 1: selectively erase, then write.** Expand the update above:
+
+$$
+S_t = S_{t-1} + \beta_t k_t v_t^\top - \beta_t k_t k_t^\top S_{t-1}
+    = S_{t-1}\big(I - \beta_t k_t k_t^\top\big) + \beta_t k_t v_t^\top
+$$
+
+The term \(I - \beta_t k_t k_t^\top\) acts on \(S_{t-1}\) *before* anything new is added: it
+removes a \(\beta_t\)-fraction of whatever \(S_{t-1}\) currently outputs along the direction
+\(k_t\), and only then is the fresh association \(\beta_t k_t v_t^\top\) written in. So
+instead of the new outer product piling on top of the old one — as in plain linear attention
+— the delta rule first *makes room* for it. Write the same key twice with \(\beta_t = 1\) and
+the second write fully overwrites the first rather than blending with it. Overwrite instead
+of interference is exactly the "forget" operation the
+[intuition](#intuition-what-linear-attention-actually-does) section found missing from
+vanilla linear attention.
+
+**View 2: one step of online gradient descent.** The same update falls out of a completely
+different starting point. Treat \(S\) as the parameters of a tiny linear regressor whose job
+is to predict \(v_t\) from \(k_t\), and define a per-token squared-error loss:
+
+$$
+\mathcal{L}_t(S) = \tfrac12 \big\lVert S^\top k_t - v_t \big\rVert^2
+$$
+
+Its gradient is \(\nabla_S \mathcal{L}_t = k_t (S^\top k_t - v_t)^\top = k_t (\bar v_t -
+v_t)^\top\), so one step of gradient descent with learning rate \(\beta_t\) gives
+
+$$
+S_t = S_{t-1} - \beta_t \nabla_S \mathcal{L}_t = S_{t-1} + \beta_t\, k_t\, (v_t - \bar v_t)^\top
+$$
+
+— identical to the update above. This is, literally, the classical delta rule / Widrow-Hoff
+LMS rule from adaptive filtering: adjust weights in proportion to the *prediction error*
+\((v_t - \bar v_t)\), not just the raw correlation between input and target. Seen this way,
+vanilla linear attention's Hebbian update \(S_t = S_{t-1} + k_t v_t^\top\) is what falls out
+of the same setup with no error-correction term at all — it always writes the full \(v_t\)
+regardless of what \(S\) already predicts, so it can never fix a stale or wrong association,
+only bury it under new ones. The delta rule instead turns \(S\) into memory that is actually
+*trained*, one token at a time, rather than memory that only ever accumulates.
+
+Both views describe the exact same arithmetic; Either way, \(S\) keeps the same fixed \(d \times d\) size and
+\(O(d^2)\) per-token cost as plain linear attention during decode, but it can now edit, not just append.
+What it still can't do is decide to forget an association wholesale, independent of whether
+the current token happens to write a similar key — that's what the explicit gate in the next
+section adds.
 
 ## The Gated Delta Update Rule
 
